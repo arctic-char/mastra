@@ -37,6 +37,14 @@ export interface MilvusCreateIndexParams extends CreateIndexParams {
   maxLength: number;
 }
 
+interface MilvusDeleteVectorParams extends DeleteVectorParams {
+    partition?: string;
+  }
+  
+  interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
+    partition?: string;
+  }
+
 export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   private client: MilvusClient;
 
@@ -74,6 +82,13 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         error,
       );
     }
+  }
+
+  transformFilter(filter?: MilvusVectorFilter): string {
+    const translator = new MilvusFilterTranslator();
+    const translated = translator.translate(filter);
+    // TODO
+    return '';
   }
 
   async query(params: QueryVectorParams<MilvusVectorFilter>): Promise<QueryResult[]> {
@@ -194,14 +209,12 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         collection_name: indexName,
       });
       if (res.code != 0) {
-        throw new MastraError(
-            {
-              id: createVectorErrorId('MILVUS', 'DELETE_INDEX', 'FAILED'),
-              domain: ErrorDomain.STORAGE,
-              category: ErrorCategory.THIRD_PARTY,
-              details: { indexName, reason: res.reason },
-            },
-          );
+        throw new MastraError({
+          id: createVectorErrorId('MILVUS', 'DELETE_INDEX', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName, reason: res.reason },
+        });
       }
     } catch (error) {
       throw new MastraError(
@@ -220,11 +233,116 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
     throw new Error('Method not implemented.');
   }
 
-  deleteVector(params: DeleteVectorParams): Promise<void> {
-    throw new Error('Method not implemented.');
+  /**
+   * Deletes a vector by its ID.
+   * @param indexName - The name of the index (collection) containing the vector.
+   * @param id - The ID of the vector to delete.
+   * @returns A promise that resolves when the deletion is complete.
+   * @throws Will throw an error if the deletion operation fails.
+   */
+  async deleteVector({ indexName, id, partition }: MilvusDeleteVectorParams): Promise<void> {
+    try {
+      await this.client.delete({
+        ids: [id],
+        collection_name: indexName,
+        partition_name: partition
+      });
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'DELETE_VECTOR', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            indexName,
+            id,
+          },
+        },
+        error,
+      );
+    }
   }
 
-  deleteVectors(params: DeleteVectorsParams<MilvusVectorFilter>): Promise<void> {
-    throw new Error('Method not implemented.');
+  /**
+   * Deletes multiple vectors by IDs or filter.
+   * @param indexName - The name of the index containing the vectors.
+   * @param ids - Array of vector IDs to delete (mutually exclusive with filter).
+   * @param filter - Filter to match vectors to delete (mutually exclusive with ids).
+   * @param partition - The partition of the collection (optional, Milvus-specific).
+   * @returns A promise that resolves when the deletion is complete.
+   * @throws Will throw an error if both ids and filter are provided, or if neither is provided.
+   */
+  async deleteVectors({ ids, indexName, filter, partition }: MilvusDeleteVectorsParams): Promise<void> {
+    // Validate mutually exclusive parameters
+    if (ids && filter) {
+      throw new MastraError({
+        id: createVectorErrorId('MILVUS', 'DELETE_VECTORS', 'MUTUALLY_EXCLUSIVE'),
+        text: 'Cannot specify both ids and filter - they are mutually exclusive',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { indexName },
+      });
+    }
+
+    if (!ids && !filter) {
+      throw new MastraError({
+        id: createVectorErrorId('MILVUS', 'DELETE_VECTORS', 'NO_TARGET'),
+        text: 'Either filter or ids must be provided',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { indexName },
+      });
+    }
+
+    // Validate ids array is not empty
+    if (ids && ids.length === 0) {
+      throw new MastraError({
+        id: createVectorErrorId('MILVUS', 'DELETE_VECTORS', 'EMPTY_IDS'),
+        text: 'Cannot delete with empty ids array',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { indexName },
+      });
+    }
+
+    // Validate filter is not empty
+    if (filter && Object.keys(filter).length === 0) {
+      throw new MastraError({
+        id: createVectorErrorId('MILVUS', 'DELETE_VECTORS', 'EMPTY_FILTER'),
+        text: 'Cannot delete with empty filter object',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { indexName },
+      });
+    }
+    try {
+      if (ids) {
+        await this.client.delete({
+          ids: ids,
+          collection_name: indexName,
+          partition_name: partition
+        });
+      } else if (filter) {
+        await this.client.deleteEntities({
+          collection_name: indexName,
+          partition_name: partition,
+          filter: this.transformFilter(filter),
+        });
+      }
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'DELETE_VECTORS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            indexName,
+            ...(filter && { filter: JSON.stringify(filter) }),
+            ...(ids && { idsCount: ids.length }),
+          },
+        },
+        error,
+      );
+    }
   }
 }
