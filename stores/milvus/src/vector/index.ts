@@ -189,7 +189,31 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   }
 
   async deleteIndex({ indexName }: DeleteIndexParams): Promise<void> {
-    throw new Error('Method not implemented.');
+    try {
+      const res = await this.client.dropCollection({
+        collection_name: indexName,
+      });
+      if (res.code != 0) {
+        throw new MastraError(
+            {
+              id: createVectorErrorId('MILVUS', 'DELETE_INDEX', 'FAILED'),
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.THIRD_PARTY,
+              details: { indexName, reason: res.reason },
+            },
+          );
+      }
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'DELETE_INDEX', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName },
+        },
+        error,
+      );
+    }
   }
 
   updateVector(params: UpdateVectorParams<MilvusVectorFilter>): Promise<void> {
