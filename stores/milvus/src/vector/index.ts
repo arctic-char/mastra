@@ -1,6 +1,6 @@
 import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import { createVectorErrorId } from '@mastra/core/storage';
-import { MastraVector } from '@mastra/core/vector';
+import { MastraVector, validateUpsertInput } from '@mastra/core/vector';
 import type {
   QueryResult,
   IndexStats,
@@ -30,6 +30,8 @@ const METRIC_MAPPING: Record<string, string> = {
   dotproduct: 'IP',
 };
 
+const BATCH_SIZE = 256;
+
 export type MilvusVectorConfig = ClientConfig & {
   /** The unique identifier for this vector store instance. */
   id: string;
@@ -48,6 +50,10 @@ export interface MilvusDeleteVectorParams extends DeleteVectorParams {
 }
 
 export interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
+  partition?: string;
+}
+
+export interface MilvusUpsertVectorParams extends UpsertVectorParams {
   partition?: string;
 }
 
@@ -160,8 +166,40 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
     }
   }
 
-  async upsert(params: UpsertVectorParams): Promise<string[]> {
-    throw new Error('Method not implemented.');
+  async upsert({ indexName, vectors, metadata, ids, partition }: MilvusUpsertVectorParams): Promise<string[]> {
+    validateUpsertInput('MILVUS', vectors, metadata, ids);
+
+    // Generate IDs if not provided
+    const vectorIds = ids || vectors.map(() => crypto.randomUUID());
+
+    const records = vectors.map((vector, i) => ({
+      id: vectorIds[i]!,
+      embedding: vector,
+      // TODO: Shold text field be provided explicitly? Do we even need it at all?   
+      ...(metadata?.[i] ?? {}),
+    }));
+
+    try {
+      for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const batch = records.slice(i, i + BATCH_SIZE);
+        await this.client.upsert({
+          collection_name: indexName,
+          partition_name: partition,
+          data: batch,
+        });
+      }
+      return vectorIds;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'UPSERT', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName, vectorCount: vectors.length },
+        },
+        error,
+      );
+    }
   }
 
   async createIndex({ indexName, dimension, metric = 'cosine', maxLength }: MilvusCreateIndexParams): Promise<void> {
