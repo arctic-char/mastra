@@ -27,6 +27,7 @@ export type StoreName =
   | 'S3'
   | 'TURBOPUFFER'
   | 'VECTORIZE'
+  | 'MILVUS'
   | (string & {});
 
 export function safelyParseJSON(input: any): any {
