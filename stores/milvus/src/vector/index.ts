@@ -169,7 +169,19 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   }
 
   async listIndexes(): Promise<string[]> {
-    throw new Error('Method not implemented.');
+    try {
+      const indexesResult = await this.client.listCollections();
+      return indexesResult?.data.map(({ name }) => name);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'LIST_INDEXES', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+        },
+        error,
+      );
+    }
   }
 
   async describeIndex({ indexName }: DescribeIndexParams): Promise<IndexStats> {
