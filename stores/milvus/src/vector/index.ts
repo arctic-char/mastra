@@ -13,7 +13,13 @@ import type {
   DeleteVectorsParams,
   UpdateVectorParams,
 } from '@mastra/core/vector';
-import { MilvusClient, type ClientConfig, DataType, type SearchResultData } from '@zilliz/milvus2-sdk-node';
+import {
+  MilvusClient,
+  type ClientConfig,
+  DataType,
+  type SearchResultData,
+  type PartitionData,
+} from '@zilliz/milvus2-sdk-node';
 
 import { MilvusFilterTranslator } from './filter';
 import type { MilvusVectorFilter } from './filter';
@@ -37,16 +43,20 @@ export interface MilvusCreateIndexParams extends CreateIndexParams {
   maxLength: number;
 }
 
-interface MilvusDeleteVectorParams extends DeleteVectorParams {
+export interface MilvusDeleteVectorParams extends DeleteVectorParams {
   partition?: string;
 }
 
-interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
+export interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
   partition?: string;
 }
 
-interface MilvusQueryVectorParams extends QueryVectorParams {
+export interface MilvusQueryVectorParams extends QueryVectorParams {
   partitions?: Array<string>;
+}
+
+export interface MilvusIndexStats extends IndexStats {
+  partitions: Record<string, PartitionData>;
 }
 
 export class MilvusVector extends MastraVector<MilvusVectorFilter> {
@@ -109,17 +119,17 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
       let results: SearchResultData[] = [];
       if (queryVector) {
         if (sparseVector) {
-            // TODO
+          // TODO
         } else {
-            const res = await this.client.search({
-                collection_name: indexName,
-                partition_names: partitions,
-                filter: translatedFilter,
-                vector: queryVector,
-                topk: topK,
-                output_fields: ["text", "embedding"]
-            });
-            results = res.results
+          const res = await this.client.search({
+            collection_name: indexName,
+            partition_names: partitions,
+            filter: translatedFilter,
+            vector: queryVector,
+            topk: topK,
+            output_fields: ['text', 'embedding'],
+          });
+          results = res.results;
         }
       } else {
         // TODO
@@ -135,8 +145,8 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         id: result.id,
         score: result.score,
         metadata: result,
-        ...(includeVector && { vector: result["embedding"] })
-    }));
+        ...(includeVector && { vector: result['embedding'] }),
+      }));
     } catch (error) {
       throw new MastraError(
         {
@@ -195,7 +205,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
           {
             name: 'text',
             data_type: DataType.VarChar,
-            max_length: 1024,
+            max_length: maxLength,
           },
         ],
         dimension: dimension,
@@ -254,8 +264,47 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
     }
   }
 
-  async describeIndex({ indexName }: DescribeIndexParams): Promise<IndexStats> {
-    throw new Error('Method not implemented.');
+  /**
+   * Retrieves statistics about a vector index (collection).
+   *
+   * @param {string} indexName - The name of the index (collection) to describe
+   * @returns A promise that resolves to the index statistics including dimension, count and metric
+   */
+  async describeIndex({ indexName }: DescribeIndexParams): Promise<MilvusIndexStats> {
+    try {
+      const stats = await this.client.getCollectionStatistics({
+        collection_name: indexName,
+      });
+
+      const partitions = await this.client.showPartitions({
+        collection_name: indexName,
+      });
+
+      const description = await this.client.describeCollection({
+        collection_name: indexName,
+      });
+
+      // TODO: custom schema support
+      const vectorField = description.schema.fields.find(f => f.name === 'embedding');
+
+      if (!vectorField) throw new Error(`No embedding field for collection ${indexName}`);
+
+      return {
+        dimension: vectorField.dim as number,
+        count: stats.data['row_count'],
+        partitions: Object.fromEntries(partitions.data.map(partition => [partition.name, partition])),
+      };
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'DESCRIBE_INDEX', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName },
+        },
+        error,
+      );
+    }
   }
 
   async deleteIndex({ indexName }: DeleteIndexParams): Promise<void> {
