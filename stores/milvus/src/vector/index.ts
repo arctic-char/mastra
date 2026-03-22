@@ -13,7 +13,7 @@ import type {
   DeleteVectorsParams,
   UpdateVectorParams,
 } from '@mastra/core/vector';
-import { MilvusClient, type ClientConfig, DataType } from '@zilliz/milvus2-sdk-node';
+import { MilvusClient, type ClientConfig, DataType, type SearchResultData } from '@zilliz/milvus2-sdk-node';
 
 import { MilvusFilterTranslator } from './filter';
 import type { MilvusVectorFilter } from './filter';
@@ -38,12 +38,16 @@ export interface MilvusCreateIndexParams extends CreateIndexParams {
 }
 
 interface MilvusDeleteVectorParams extends DeleteVectorParams {
-    partition?: string;
-  }
-  
-  interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
-    partition?: string;
-  }
+  partition?: string;
+}
+
+interface MilvusDeleteVectorsParams extends DeleteVectorsParams<MilvusVectorFilter> {
+  partition?: string;
+}
+
+interface MilvusQueryVectorParams extends QueryVectorParams {
+  partitions?: Array<string>;
+}
 
 export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   private client: MilvusClient;
@@ -91,8 +95,59 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
     return '';
   }
 
-  async query(params: QueryVectorParams<MilvusVectorFilter>): Promise<QueryResult[]> {
-    throw new Error('Method not implemented.');
+  async query({
+    indexName,
+    queryVector,
+    topK = 10,
+    filter,
+    includeVector = false,
+    partitions,
+    sparseVector,
+  }: MilvusQueryVectorParams): Promise<QueryResult[]> {
+    const translatedFilter = this.transformFilter(filter) ?? undefined;
+    try {
+      let results: SearchResultData[] = [];
+      if (queryVector) {
+        if (sparseVector) {
+            // TODO
+        } else {
+            const res = await this.client.search({
+                collection_name: indexName,
+                partition_names: partitions,
+                filter: translatedFilter,
+                vector: queryVector,
+                topk: topK,
+                output_fields: ["text", "embedding"]
+            });
+            results = res.results
+        }
+      } else {
+        // TODO
+        // const res = await this.client.query({
+        //     collection_name: indexName,
+        //     partition_names: partitions,
+        //     filter: this.transformFilter(filter),
+        //     output_fields: ["text", "embedding"]
+        // });
+        // results = res.data
+      }
+      return results.map(result => ({
+        id: result.id,
+        score: result.score,
+        metadata: result,
+        ...(includeVector && { vector: result["embedding"] })
+    }));
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('MILVUS', 'QUERY', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName, topK, filter: JSON.stringify(filter) },
+        },
+        error,
+      );
+    }
   }
 
   async upsert(params: UpsertVectorParams): Promise<string[]> {
@@ -245,7 +300,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
       await this.client.delete({
         ids: [id],
         collection_name: indexName,
-        partition_name: partition
+        partition_name: partition,
       });
     } catch (error) {
       throw new MastraError(
@@ -265,7 +320,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
 
   /**
    * Deletes multiple vectors by IDs or filter.
-   * @param indexName - The name of the index containing the vectors.
+   * @param indexName - The name of the index (collection) containing the vectors.
    * @param ids - Array of vector IDs to delete (mutually exclusive with filter).
    * @param filter - Filter to match vectors to delete (mutually exclusive with ids).
    * @param partition - The partition of the collection (optional, Milvus-specific).
@@ -320,7 +375,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         await this.client.delete({
           ids: ids,
           collection_name: indexName,
-          partition_name: partition
+          partition_name: partition,
         });
       } else if (filter) {
         await this.client.deleteEntities({
