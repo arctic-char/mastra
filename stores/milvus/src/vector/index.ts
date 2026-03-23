@@ -12,11 +12,14 @@ import type {
   DeleteVectorParams,
   DeleteVectorsParams,
   UpdateVectorParams,
+  SparseVector,
 } from '@mastra/core/vector';
 import {
   MilvusClient,
   type ClientConfig,
   DataType,
+  IndexType,
+  RRFRanker,
   type SearchResultData,
   type PartitionData,
 } from '@zilliz/milvus2-sdk-node';
@@ -33,6 +36,12 @@ const METRIC_MAPPING: Record<string, string> = {
 
 /** Batch size for SDK `upsert` calls. */
 const BATCH_SIZE = 256;
+
+/** Dense float vector field (HNSW). */
+const DENSE_VECTOR_FIELD = 'dense_embedding';
+
+/** Sparse field for hybrid search (SPARSE_INVERTED_INDEX / IP). */
+const SPARSE_VECTOR_FIELD = 'sparse_embedding';
 
 export type MilvusVectorConfig = ClientConfig & {
   /** The unique identifier for this vector store instance. */
@@ -96,14 +105,24 @@ type MilvusUpdateVectorParams =
       partition?: string;
     };
 
+function milvusSparsePayload(sparse?: SparseVector): { indices: number[]; values: number[] } {
+  if (!sparse) {
+    return { indices: [], values: [] };
+  }
+  if (sparse.indices.length !== sparse.values.length) {
+    throw new Error('sparse vector indices and values must have the same length');
+  }
+  return { indices: sparse.indices, values: sparse.values };
+}
+
 /**
  * Vector store backed by [Milvus](https://milvus.io/).
  *
  * @remarks
- * - Mastra **`indexName`** maps to a Milvus **collection** with fields `id`, `embedding` (FloatVector), and `metadata` (JSON).
- * - Metrics: `cosine`, `euclidean`, `dotproduct` → HNSW vector index on `embedding`.
+ * - Mastra **`indexName`** maps to a Milvus **collection** with fields `id`, `dense_embedding` (FloatVector), `sparse_embedding` (SparseFloatVector), and `metadata` (JSON).
+ * - Metrics: `cosine`, `euclidean`, `dotproduct` → HNSW on `embedding`; sparse uses `SPARSE_INVERTED_INDEX` with IP for hybrid.
  * - {@link transformFilter} converts Mastra filters to Milvus boolean expressions on `metadata`.
- * - {@link query} requires `queryVector`; metadata-only search is not supported.
+ * - {@link query} requires `queryVector`; optional `sparseVector` triggers hybrid search (RRF). Metadata-only search is not supported.
  */
 export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   private client: MilvusClient;
@@ -194,7 +213,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
    * @param params.filter - Optional metadata filter (Milvus expression).
    * @param params.includeVector - When true, include stored vectors in results.
    * @param params.partitions - Optional partition subset to search.
-   * @param params.sparseVector - Reserved; sparse search is not implemented yet.
+   * @param params.sparseVector - When set, runs **hybrid** search (dense + sparse) with RRF reranking.
    * @returns Ranked hits with `id`, `score`, and row payload as `metadata`.
    * @throws {MastraError} If `queryVector` is missing or Milvus returns an error.
    */
@@ -220,16 +239,52 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
     try {
       await this.loadCollection(indexName, 'QUERY');
       let results: SearchResultData[] = [];
+      const output_fields = ['id', 'metadata', DENSE_VECTOR_FIELD, SPARSE_VECTOR_FIELD];
       if (sparseVector) {
-        throw new Error("Hybrid search not implemented");
+        let sparsePayload: { indices: number[]; values: number[] };
+        try {
+          sparsePayload = milvusSparsePayload(sparseVector);
+        } catch (error) {
+          throw new MastraError(
+            {
+              id: createVectorErrorId('MILVUS', 'QUERY', 'INVALID_SPARSE_VECTOR'),
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.USER,
+              details: { indexName },
+            },
+            error,
+          );
+        }
+        const res = await this.client.search({
+          collection_name: indexName,
+          ...(partitions?.length ? { partition_names: partitions } : {}),
+          ...(translatedFilter ? { filter: translatedFilter } : {}),
+          data: [
+            {
+              data: queryVector,
+              anns_field: DENSE_VECTOR_FIELD,
+              topk: topK,
+            },
+            {
+              data: sparsePayload,
+              anns_field: SPARSE_VECTOR_FIELD,
+              topk: topK,
+            },
+          ],
+          rerank: RRFRanker(),
+          topk: topK,
+          output_fields,
+        });
+        results = res.results;
       } else {
         const res = await this.client.search({
           collection_name: indexName,
           ...(partitions?.length ? { partition_names: partitions } : {}),
           ...(translatedFilter ? { filter: translatedFilter } : {}),
           vector: queryVector,
+          anns_field: DENSE_VECTOR_FIELD,
           topk: topK,
-          output_fields: ['id', 'metadata', 'embedding'],
+          output_fields,
         });
         results = res.results;
       }
@@ -237,7 +292,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         id: result.id,
         score: result.score,
         metadata: result,
-        ...(includeVector && { vector: result['embedding'] }),
+        ...(includeVector && { vector: result[DENSE_VECTOR_FIELD] }),
       }));
     } catch (error) {
       if (error instanceof MastraError) throw error;
@@ -246,7 +301,12 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
           id: createVectorErrorId('MILVUS', 'QUERY', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { indexName, topK, filter: JSON.stringify(filter) },
+          details: {
+            indexName,
+            topK,
+            filter: JSON.stringify(filter),
+            hybrid: Boolean(sparseVector),
+          },
         },
         error,
       );
@@ -261,21 +321,55 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
    * @param params.metadata - Optional JSON metadata per row (stored in `metadata` field).
    * @param params.ids - Optional primary keys (VARCHAR); UUIDs generated if omitted.
    * @param params.partition - Optional Milvus partition name.
+   * @param params.sparseVectors - Optional sparse rows (same length as `vectors` when provided); omitted rows store an empty sparse vector.
    * @returns The IDs used for all upserted rows.
    * @throws {MastraError} On validation failure or Milvus errors.
-   * @remarks Releases the collection after write so a subsequent load picks up new data for search.
+   * @remarks Calls {@link flush} after writes so segments (and indexes) see new data reliably.
    */
-  async upsert({ indexName, vectors, metadata, ids, partition }: MilvusUpsertVectorParams): Promise<string[]> {
+  async upsert({
+    indexName,
+    vectors,
+    metadata,
+    ids,
+    partition,
+    sparseVectors,
+  }: MilvusUpsertVectorParams): Promise<string[]> {
     validateUpsertInput('MILVUS', vectors, metadata, ids);
+    if (sparseVectors && sparseVectors.length !== vectors.length) {
+      throw new MastraError({
+        id: createVectorErrorId('MILVUS', 'UPSERT', 'SPARSE_LENGTH_MISMATCH'),
+        text: 'sparseVectors length must match vectors length when provided',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { indexName, vectorCount: vectors.length, sparseCount: sparseVectors.length },
+      });
+    }
 
     // Generate IDs if not provided
     const vectorIds = ids || vectors.map(() => crypto.randomUUID());
 
-    const records = vectors.map((vector, i) => ({
-      id: vectorIds[i]!,
-      embedding: vector,
-      metadata: metadata?.[i] ?? {},
-    }));
+    const records = vectors.map((vector, i) => {
+      let sparsePayload: { indices: number[]; values: number[] };
+      try {
+        sparsePayload = milvusSparsePayload(sparseVectors?.[i]);
+      } catch (error) {
+        throw new MastraError(
+          {
+            id: createVectorErrorId('MILVUS', 'UPSERT', 'INVALID_SPARSE_VECTOR'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            details: { indexName, rowIndex: i },
+          },
+          error,
+        );
+      }
+      return {
+        id: vectorIds[i]!,
+        [DENSE_VECTOR_FIELD]: vector,
+        [SPARSE_VECTOR_FIELD]: sparsePayload,
+        metadata: metadata?.[i] ?? {},
+      };
+    });
 
     try {
       await this.loadCollection(indexName, 'UPSERT');
@@ -310,7 +404,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
    * @param params.dimension - Vector dimension (positive integer).
    * @param params.metric - `cosine` | `euclidean` | `dotproduct` (default `cosine`).
    * @throws {MastraError} If arguments are invalid or Milvus returns an error.
-   * @remarks Schema: `id` (VARCHAR PK), `embedding` (FloatVector), `metadata` (JSON).
+   * @remarks Schema: `id` (VARCHAR PK), `dense_embedding` (FloatVector), `sparse_embedding` (SparseFloatVector), `metadata` (JSON).
    */
   async createIndex({ indexName, dimension, metric = 'cosine' }: CreateIndexParams): Promise<void> {
     try {
@@ -344,16 +438,14 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
             autoID: false,
           },
           {
-            name: 'embedding',
+            name: DENSE_VECTOR_FIELD,
             data_type: DataType.FloatVector,
             dim: dimension,
           },
-          // TODO:
-          //   {
-          //     name: 'sparse_embedding',
-          //     data_type: DataType.SparseFloatVector,
-          //     dim: dimension,
-          //   },
+          {
+            name: SPARSE_VECTOR_FIELD,
+            data_type: DataType.SparseFloatVector,
+          },
           {
             name: 'metadata',
             data_type: DataType.JSON,
@@ -373,9 +465,8 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
 
       const indexRes = await this.client.createIndex({
         collection_name: indexName,
-        field_name: 'embedding',
+        field_name: DENSE_VECTOR_FIELD,
         metric_type: METRIC_MAPPING[metric],
-        // TODO: Support other ANN algs
         index_type: 'HNSW',
       });
 
@@ -385,6 +476,22 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: { indexName, dimension, metric, reason: indexRes.reason },
+        });
+      }
+
+      const sparseIndexRes = await this.client.createIndex({
+        collection_name: indexName,
+        field_name: SPARSE_VECTOR_FIELD,
+        index_type: IndexType.SPARSE_INVERTED_INDEX,
+        metric_type: 'IP',
+      });
+
+      if (sparseIndexRes.code != 0) {
+        throw new MastraError({
+          id: createVectorErrorId('MILVUS', 'CREATE_INDEX', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { indexName, dimension, metric, reason: sparseIndexRes.reason },
         });
       }
     } catch (error: any) {
@@ -434,7 +541,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   async describeIndex({ indexName }: DescribeIndexParams): Promise<MilvusIndexStats> {
     try {
       await this.loadCollection(indexName, 'DESCRIBE_INDEX');
-      
+
       const count = await this.client.count({ collection_name: indexName });
 
       const partitions = await this.client.showPartitions({
@@ -445,10 +552,9 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
         collection_name: indexName,
       });
 
-      // TODO: custom schema support
-      const vectorField = description.schema.fields.find(f => f.name === 'embedding');
+      const vectorField = description.schema.fields.find(f => f.name === DENSE_VECTOR_FIELD);
 
-      if (!vectorField) throw new Error(`No embedding field for collection ${indexName}`);
+      if (!vectorField) throw new Error(`No ${DENSE_VECTOR_FIELD} field for collection ${indexName}`);
 
       return {
         dimension: parseInt(vectorField.dim as string),

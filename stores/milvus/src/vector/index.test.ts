@@ -80,6 +80,26 @@ describe('MilvusVector', () => {
         }),
       ).rejects.toThrow(MastraError);
     });
+
+    it('should reject sparseVectors length mismatch', async () => {
+      await expect(
+        milvus.upsert({
+          indexName: 'any',
+          vectors: [createVector(1), createVector(2)],
+          sparseVectors: [{ indices: [1], values: [1] }],
+        }),
+      ).rejects.toThrow(MastraError);
+    });
+
+    it('should reject sparse row with indices/values length mismatch on upsert', async () => {
+      await expect(
+        milvus.upsert({
+          indexName: 'any',
+          vectors: [createVector(1)],
+          sparseVectors: [{ indices: [1, 2], values: [1] }],
+        }),
+      ).rejects.toThrow(MastraError);
+    });
   });
 
   describe('Integration', () => {
@@ -375,8 +395,10 @@ describe('MilvusVector', () => {
       expect(results).toHaveLength(1);
     }, 120000);
 
-    it('should return no dense results when sparseVector is set (not yet implemented)', async () => {
+    it('should hybrid search when sparseVector is set (dense + sparse RRF)', async () => {
       indexToCleanup = uniqueIndexName();
+      const sparseDim = 100;
+      const sparseVec = { indices: [sparseDim], values: [1.0] };
 
       await milvus.createIndex({
         indexName: indexToCleanup,
@@ -387,6 +409,7 @@ describe('MilvusVector', () => {
       await milvus.upsert({
         indexName: indexToCleanup,
         vectors: [createVector(90)],
+        sparseVectors: [sparseVec],
       });
       await flushIndex(indexToCleanup!);
 
@@ -394,9 +417,168 @@ describe('MilvusVector', () => {
         indexName: indexToCleanup,
         queryVector: createVector(90),
         topK: 5,
-        sparseVector: { indices: [0], values: [1] },
+        sparseVector: sparseVec,
       });
-      expect(results).toEqual([]);
+      expect(results.length).toBeGreaterThanOrEqual(1);
+      expect(results[0]?.id).toBeDefined();
+    }, 120000);
+
+    it('should upsert mixed sparse rows (empty + non-empty) and hybrid-query the non-empty row', async () => {
+      indexToCleanup = uniqueIndexName();
+      const sparseDim = 210;
+      const sparseVec = { indices: [sparseDim], values: [2.0] };
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      const [idEmpty, idSparse] = await milvus.upsert({
+        indexName: indexToCleanup,
+        vectors: [createVector(91), createVector(92)],
+        metadata: [{ slot: 'no_sparse' }, { slot: 'has_sparse' }],
+        sparseVectors: [{ indices: [], values: [] }, sparseVec],
+      });
+      await flushIndex(indexToCleanup!);
+
+      const hybrid = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: createVector(92),
+        topK: 4,
+        sparseVector: sparseVec,
+      });
+      expect(hybrid.map(r => r.id)).toContain(idSparse);
+      expect(hybrid.map(r => r.id)).toContain(idEmpty);
+
+      const denseOnly = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: createVector(91),
+        topK: 2,
+      });
+      expect(denseOnly.map(r => r.id)).toContain(idEmpty);
+    }, 120000);
+
+    it('should include dense vector in hybrid query when includeVector is true', async () => {
+      indexToCleanup = uniqueIndexName();
+      const sparseDim = 220;
+      const sparseVec = { indices: [sparseDim], values: [1.0] };
+      const dense = createVector(93);
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      await milvus.upsert({
+        indexName: indexToCleanup,
+        vectors: [dense],
+        sparseVectors: [sparseVec],
+      });
+      await flushIndex(indexToCleanup!);
+
+      const results = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: dense,
+        topK: 2,
+        sparseVector: sparseVec,
+        includeVector: true,
+      });
+      expect(results[0]?.vector).toBeDefined();
+      expect(results[0]!.vector!.length).toBe(VECTOR_DIMENSION);
+    }, 120000);
+
+    it('should hybrid search with metadata filter', async () => {
+      indexToCleanup = uniqueIndexName();
+      const dA = 230;
+      const dB = 231;
+      const sparseA = { indices: [dA], values: [1.0] };
+      const sparseB = { indices: [dB], values: [1.0] };
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      await milvus.upsert({
+        indexName: indexToCleanup,
+        vectors: [createVector(94), createVector(95)],
+        metadata: [{ branch: 'a' }, { branch: 'b' }],
+        sparseVectors: [sparseA, sparseB],
+      });
+      await flushIndex(indexToCleanup!);
+
+      const filtered = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: createVector(95),
+        topK: 5,
+        sparseVector: sparseB,
+        filter: { branch: 'a' },
+      });
+      expect(filtered).toHaveLength(1);
+      const meta = filtered[0]!.metadata as Record<string, unknown> | undefined;
+      expect(meta?.metadata).toEqual({ branch: 'a' });
+    }, 120000);
+
+    it('should hybrid search with partitions option', async () => {
+      indexToCleanup = uniqueIndexName();
+      const sparseDim = 240;
+      const sparseVec = { indices: [sparseDim], values: [1.0] };
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      await milvus.upsert({
+        indexName: indexToCleanup,
+        vectors: [createVector(96)],
+        metadata: [{ p: true }],
+        partition: '_default',
+        sparseVectors: [sparseVec],
+      });
+      await flushIndex(indexToCleanup!);
+
+      const results = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: createVector(96),
+        topK: 2,
+        sparseVector: sparseVec,
+        partitions: ['_default'],
+      });
+      expect(results.length).toBeGreaterThanOrEqual(1);
+    }, 120000);
+
+    it('should surface sparse channel in hybrid results when query sparse matches a different row than dense', async () => {
+      indexToCleanup = uniqueIndexName();
+      const dimOnlyB = 250;
+      const sparseForB = { indices: [dimOnlyB], values: [1.0] };
+      const sparseForA = { indices: [251], values: [1.0] };
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      const [idA, idB] = await milvus.upsert({
+        indexName: indexToCleanup,
+        vectors: [createVector(97), createVector(98)],
+        sparseVectors: [sparseForA, sparseForB],
+      });
+      await flushIndex(indexToCleanup!);
+
+      const results = await milvus.query({
+        indexName: indexToCleanup,
+        queryVector: createVector(97),
+        topK: 4,
+        sparseVector: sparseForB,
+      });
+      expect(results.map(r => r.id)).toContain(idA);
+      expect(results.map(r => r.id)).toContain(idB);
     }, 120000);
 
     it('should upsert with partition option targeting default partition', async () => {
@@ -609,6 +791,25 @@ describe('MilvusVector', () => {
           indexName: indexToCleanup,
           queryVector: undefined as unknown as number[],
           topK: 1,
+        }),
+      ).rejects.toThrow(MastraError);
+    }, 120000);
+
+    it('should throw when hybrid query sparseVector has indices/values length mismatch', async () => {
+      indexToCleanup = uniqueIndexName();
+
+      await milvus.createIndex({
+        indexName: indexToCleanup,
+        dimension: VECTOR_DIMENSION,
+      });
+      await flushIndex(indexToCleanup!);
+
+      await expect(
+        milvus.query({
+          indexName: indexToCleanup,
+          queryVector: createVector(1),
+          topK: 2,
+          sparseVector: { indices: [1, 2], values: [1] },
         }),
       ).rejects.toThrow(MastraError);
     }, 120000);
