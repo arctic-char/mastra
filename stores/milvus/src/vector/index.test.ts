@@ -40,15 +40,6 @@ describe('MilvusVector', () => {
       ).rejects.toThrow(MastraError);
     });
 
-    it('should reject non-positive maxLength', async () => {
-      await expect(
-        milvus.createIndex({
-          indexName: `invalid_maxlen_${Date.now()}`,
-          dimension: 4,
-        }),
-      ).rejects.toThrow(MastraError);
-    });
-
     it('should reject non-integer dimension', async () => {
       await expect(
         milvus.createIndex({

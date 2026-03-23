@@ -151,37 +151,6 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
   }
 
   /**
-   * Releases a collection from memory on query nodes.
-   *
-   * @param name - Collection name (Mastra index name).
-   * @param action - Logical operation label for error IDs.
-   */
-  private async releaseCollection(name: string, action: string) {
-    try {
-      const res = await this.client.releaseCollection({ collection_name: name });
-      if (res.code != 0) {
-        throw new MastraError({
-          id: createVectorErrorId('MILVUS', action, 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: { indexName: name, reason: res.reason },
-        });
-      }
-    } catch (error) {
-      if (error instanceof MastraError) throw error;
-      throw new MastraError(
-        {
-          id: createVectorErrorId('MILVUS', action, 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: { indexName: name },
-        },
-        error,
-      );
-    }
-  }
-
-  /**
    * Translates a Mastra vector filter into a Milvus boolean expression string, or `undefined` if empty.
    *
    * @param filter - Mongo-style filter; unsupported operators throw during translation when used.
@@ -252,15 +221,15 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
       await this.loadCollection(indexName, 'QUERY');
       let results: SearchResultData[] = [];
       if (sparseVector) {
-        // TODO
+        throw new Error("Hybrid search not implemented");
       } else {
         const res = await this.client.search({
           collection_name: indexName,
-          partition_names: partitions,
-          filter: translatedFilter,
+          ...(partitions?.length ? { partition_names: partitions } : {}),
+          ...(translatedFilter ? { filter: translatedFilter } : {}),
           vector: queryVector,
           topk: topK,
-          output_fields: ['text', 'embedding', 'metadata'],
+          output_fields: ['id', 'metadata', 'embedding'],
         });
         results = res.results;
       }
@@ -318,8 +287,7 @@ export class MilvusVector extends MastraVector<MilvusVectorFilter> {
           data: batch,
         });
       }
-      // Reload the collection so the index includes new vectors (dumb)
-      await this.releaseCollection(indexName, 'UPSERT');
+      await this.flush({ indexName });
       return vectorIds;
     } catch (error) {
       if (error instanceof MastraError) throw error;
